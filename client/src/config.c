@@ -177,11 +177,18 @@ static struct Option options[] =
   },
   {
     .module         = "win",
+    .name           = "minimizeOnFocusLoss",
+    .description    = "Minimize window on focus loss",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true,
+  },
+  {
+    .module         = "win",
     .name           = "fpsLimit",
-    .description    = "Frame rate limit (0 = disable - not recommended)",
+    .description    = "Frame rate limit (0 = disable - not recommended, -1 = auto detect)",
     .shortopt       = 'K',
     .type           = OPTION_TYPE_INT,
-    .value.x_int    = 200,
+    .value.x_int    = -1,
   },
   {
     .module         = "win",
@@ -395,6 +402,8 @@ bool config_load(int argc, char * argv[])
   params.escapeKey     = option_get_int   ("input", "escapeKey"   );
   params.hideMouse     = option_get_bool  ("input", "hideCursor"  );
   params.mouseSens     = option_get_int   ("input", "mouseSens"   );
+
+  params.minimizeOnFocusLoss = option_get_bool("win", "minimizeOnFocusLoss");
 
   if (option_get_bool("spice", "enable"))
   {

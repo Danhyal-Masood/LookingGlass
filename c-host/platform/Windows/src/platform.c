@@ -24,10 +24,13 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <windows.h>
 #include <setupapi.h>
 #include <shellapi.h>
+#include <fcntl.h>
+#include <io.h>
 
 #include "interface/platform.h"
 #include "common/debug.h"
 #include "common/option.h"
+#include "common/locking.h"
 #include "windows/debug.h"
 #include "ivshmem.h"
 
@@ -36,6 +39,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 struct AppState
 {
+  LARGE_INTEGER perfFreq;
   HINSTANCE hInst;
 
   int     argc;
@@ -66,6 +70,20 @@ struct osThreadHandle
 
   int                resultCode;
 };
+
+struct osEventHandle
+{
+  volatile int  lock;
+  bool          reset;
+  HANDLE        handle;
+  bool          wrapped;
+  unsigned int  msSpinTime;
+  volatile bool signaled;
+};
+
+// undocumented API to adjust the system timer resolution (yes, its a nasty hack)
+typedef NTSTATUS (__stdcall *ZwSetTimerResolution_t)(ULONG RequestedResolution, BOOLEAN Set, PULONG ActualResolution);
+static ZwSetTimerResolution_t ZwSetTimerResolution = NULL;
 
 LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -157,6 +175,21 @@ static BOOL WINAPI CtrlHandler(DWORD dwCtrlType)
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
+  /* this is a bit of a hack but without this --help will produce no output in a windows command prompt */
+  if (!IsDebuggerPresent() && AttachConsole(ATTACH_PARENT_PROCESS))
+  {
+    HANDLE std_err = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE std_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    int std_err_fd = _open_osfhandle((intptr_t)std_err, _O_TEXT);
+    int std_out_fd = _open_osfhandle((intptr_t)std_out, _O_TEXT);
+
+    if (std_err_fd > 0)
+      *stderr = *_fdopen(std_err_fd, "w");
+
+    if  (std_out_fd > 0)
+      *stdout = *_fdopen(std_out_fd, "w");
+  }
+
   int result = 0;
   app.hInst = hInstance;
 
@@ -290,6 +323,18 @@ bool app_init()
   // always flush stderr
   setbuf(stderr, NULL);
 
+  // Increase the timer resolution
+  ZwSetTimerResolution = (ZwSetTimerResolution_t)GetProcAddress(GetModuleHandle("ntdll.dll"), "ZwSetTimerResolution");
+  if (ZwSetTimerResolution)
+  {
+    ULONG actualResolution;
+    ZwSetTimerResolution(1, true, &actualResolution);
+    DEBUG_INFO("System timer resolution: %.2f ns", (float)actualResolution / 100.0f);
+  }
+
+  // get the performance frequency for spinlocks
+  QueryPerformanceFrequency(&app.perfFreq);
+
   HDEVINFO                         deviceInfoSet;
   PSP_DEVICE_INTERFACE_DETAIL_DATA infData = NULL;
   SP_DEVICE_INTERFACE_DATA         deviceInterfaceData;
@@ -368,11 +413,16 @@ bool os_shmemMmap(void **ptr)
     return true;
   }
 
+  IVSHMEM_MMAP_CONFIG config =
+  {
+    .cacheMode = IVSHMEM_CACHE_WRITECOMBINED
+  };
+
   memset(&app.shmemMap, 0, sizeof(IVSHMEM_MMAP));
   if (!DeviceIoControl(
     app.shmemHandle,
     IOCTL_IVSHMEM_REQUEST_MMAP,
-    NULL, 0,
+    &config, sizeof(IVSHMEM_MMAP_CONFIG),
     &app.shmemMap, sizeof(IVSHMEM_MMAP),
     NULL, NULL))
   {
@@ -453,36 +503,116 @@ bool os_joinThread(osThreadHandle * handle, int * resultCode)
   return false;
 }
 
-osEventHandle * os_createEvent(bool autoReset)
+osEventHandle * os_createEvent(bool autoReset, unsigned int msSpinTime)
 {
-  HANDLE event = CreateEvent(NULL, autoReset ? FALSE : TRUE, FALSE, NULL);
+  osEventHandle * event = (osEventHandle *)malloc(sizeof(osEventHandle));
   if (!event)
   {
-    DEBUG_WINERROR("Failed to create the event", GetLastError());
+    DEBUG_ERROR("out of ram");
     return NULL;
   }
 
-  return (osEventHandle*)event;
+  event->lock       = 0;
+  event->reset      = autoReset;
+  event->handle     = CreateEvent(NULL, autoReset ? FALSE : TRUE, FALSE, NULL);
+  event->wrapped    = false;
+  event->msSpinTime = msSpinTime;
+  event->signaled   = false;
+
+  if (!event->handle)
+  {
+    DEBUG_WINERROR("Failed to create the event", GetLastError());
+    free(event);
+    return NULL;
+  }
+
+  return event;
 }
 
-osEventHandle * os_wrapEvent(HANDLE event)
+osEventHandle * os_wrapEvent(HANDLE handle)
 {
-  return (osEventHandle*)event;
+  osEventHandle * event = (osEventHandle *)malloc(sizeof(osEventHandle));
+  if (!event)
+  {
+    DEBUG_ERROR("out of ram");
+    return NULL;
+  }
+
+  event->lock       = 0;
+  event->reset      = false;
+  event->handle     = handle;
+  event->wrapped    = true;
+  event->msSpinTime = 0;
+  event->signaled   = false;
+  return event;
 }
 
-void os_freeEvent(osEventHandle * handle)
+void os_freeEvent(osEventHandle * event)
 {
-  CloseHandle((HANDLE)handle);
+  CloseHandle(event->handle);
 }
 
-bool os_waitEvent(osEventHandle * handle, unsigned int timeout)
+bool os_waitEvent(osEventHandle * event, unsigned int timeout)
 {
+  // wrapped events can't be enahnced
+  if (!event->wrapped)
+  {
+    if (event->signaled)
+    {
+      if (event->reset)
+        event->signaled = false;
+      return true;
+    }
+
+    if (timeout == 0)
+    {
+      bool ret = event->signaled;
+      if (event->reset)
+        event->signaled = false;
+      return ret;
+    }
+
+    if (event->msSpinTime)
+    {
+      unsigned int spinTime = event->msSpinTime;
+      if (timeout != TIMEOUT_INFINITE)
+      {
+        if (timeout > event->msSpinTime)
+          timeout -= event->msSpinTime;
+        else
+        {
+          spinTime -= timeout;
+          timeout   = 0;
+        }
+      }
+
+      LARGE_INTEGER end, now;
+      QueryPerformanceCounter(&end);
+      end.QuadPart += (app.perfFreq.QuadPart / 1000) * spinTime;
+      while(!event->signaled)
+      {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= end.QuadPart)
+          break;
+      }
+
+      if (event->signaled)
+      {
+        if (event->reset)
+          event->signaled = false;
+        return true;
+      }
+    }
+  }
+
   const DWORD to = (timeout == TIMEOUT_INFINITE) ? INFINITE : (DWORD)timeout;
   while(true)
   {
-    switch(WaitForSingleObject((HANDLE)handle, to))
+    switch(WaitForSingleObject(event->handle, to))
     {
       case WAIT_OBJECT_0:
+        if (!event->reset)
+          event->signaled = true;
         return true;
 
       case WAIT_ABANDONED:
@@ -504,18 +634,24 @@ bool os_waitEvent(osEventHandle * handle, unsigned int timeout)
   }
 }
 
-bool os_waitEvents(osEventHandle * handles[], int count, bool waitAll, unsigned int timeout)
+bool os_waitEvents(osEventHandle * events[], int count, bool waitAll, unsigned int timeout)
 {
   const DWORD to = (timeout == TIMEOUT_INFINITE) ? INFINITE : (DWORD)timeout;
+
+  HANDLE * handles = (HANDLE *)malloc(sizeof(HANDLE) * count);
+  for(int i = 0; i < count; ++i)
+    handles[i] = events[i]->handle;
+
   while(true)
   {
-    DWORD result = WaitForMultipleObjects(count, (HANDLE*)handles, waitAll, to);
+    DWORD result = WaitForMultipleObjects(count, handles, waitAll, to);
     if (result >= WAIT_OBJECT_0 && result < count)
     {
-      // null non signalled events from the handle list
+      // null non signaled events from the handle list
       for(int i = 0; i < count; ++i)
-        if (i != result && !os_waitEvent(handles[i], 0))
+        if (i != result && !os_waitEvent(events[i], 0))
           handles[i] = NULL;
+      free(handles);
       return true;
     }
 
@@ -528,24 +664,29 @@ bool os_waitEvents(osEventHandle * handles[], int count, bool waitAll, unsigned 
         if (timeout == TIMEOUT_INFINITE)
           continue;
 
+        free(handles);
         return false;
 
       case WAIT_FAILED:
         DEBUG_WINERROR("Wait for event failed", GetLastError());
+        free(handles);
         return false;
     }
 
     DEBUG_ERROR("Unknown wait event return code");
+    free(handles);
     return false;
   }
 }
 
-bool os_signalEvent(osEventHandle * handle)
+bool os_signalEvent(osEventHandle * event)
 {
-  return SetEvent((HANDLE)handle);
+  event->signaled = true;
+  return SetEvent(event->handle);
 }
 
-bool os_resetEvent(osEventHandle * handle)
+bool os_resetEvent(osEventHandle * event)
 {
-  return ResetEvent((HANDLE)handle);
+  event->signaled = false;
+  return ResetEvent(event->handle);
 }

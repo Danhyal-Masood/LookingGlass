@@ -1,5 +1,5 @@
 /*
-Looking Glass - KVM FrameRelay (KVMFR) Client
+KVMGFX Client - A KVM Client for VGA Passthrough
 Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
@@ -19,19 +19,30 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #pragma once
 
+#include <stdlib.h>
 #include <stdbool.h>
-#include <stddef.h>
+#include <stdint.h>
 
-#include <GL/gl.h>
+typedef struct stFrameBuffer * FrameBuffer;
 
-typedef struct EGL_Shader EGL_Shader;
+typedef bool (*FrameBufferReadFn)(void * opaque, const void * src, size_t size);
 
-bool egl_shader_init(EGL_Shader ** shader);
-void egl_shader_free(EGL_Shader ** shader);
+/**
+ * Read data from the KVMFRFrame into the dst buffer
+ */
+bool framebuffer_read(const FrameBuffer frame, void * dst, size_t size);
 
-bool egl_shader_load   (EGL_Shader * model, const char * vertex_file, const char * fragment_file);
-bool egl_shader_compile(EGL_Shader * model, const char * vertex_code, size_t vertex_size, const char * fragment_code, size_t fragment_size);
-void egl_shader_use    (EGL_Shader * shader);
+/**
+ * Read data from the KVMFRFrame using a callback
+ */
+bool framebuffer_read_fn(const FrameBuffer frame, FrameBufferReadFn fn, size_t size, void * opaque);
 
-void egl_shader_associate_textures(EGL_Shader * shader, const int count);
-GLint egl_shader_get_uniform_location(EGL_Shader * shader, const char * name);
+/**
+ * Prepare the framebuffer for writing
+ */
+void framebuffer_prepare(const FrameBuffer frame);
+
+/**
+ * Write data from the src buffer into the KVMFRFrame
+ */
+bool framebuffer_write(const FrameBuffer frame, const void * src, size_t size);

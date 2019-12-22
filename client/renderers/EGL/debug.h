@@ -19,19 +19,9 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #pragma once
 
-#include <stdbool.h>
-#include <stddef.h>
+#include <common/debug.h>
 
-#include <GL/gl.h>
+#define EGL_DEBUG_PRINT(type, fmt, ...) do {egl_debug_printf(type " %20s:%-4u | %-30s | " fmt, STRIPPATH(__FILE__), __LINE__, __FUNCTION__, ##__VA_ARGS__);} while (0)
+#define EGL_ERROR(fmt, ...) EGL_DEBUG_PRINT("[E]", fmt, ##__VA_ARGS__)
 
-typedef struct EGL_Shader EGL_Shader;
-
-bool egl_shader_init(EGL_Shader ** shader);
-void egl_shader_free(EGL_Shader ** shader);
-
-bool egl_shader_load   (EGL_Shader * model, const char * vertex_file, const char * fragment_file);
-bool egl_shader_compile(EGL_Shader * model, const char * vertex_code, size_t vertex_size, const char * fragment_code, size_t fragment_size);
-void egl_shader_use    (EGL_Shader * shader);
-
-void egl_shader_associate_textures(EGL_Shader * shader, const int count);
-GLint egl_shader_get_uniform_location(EGL_Shader * shader, const char * name);
+void egl_debug_printf(char * format, ...);

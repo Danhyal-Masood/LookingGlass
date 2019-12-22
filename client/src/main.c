@@ -48,7 +48,16 @@ static int cursorThread(void * unused);
 static int renderThread(void * unused);
 static int frameThread (void * unused);
 
-struct AppState  state;
+static bool       b_startup = false;
+static SDL_mutex *m_startup;
+static SDL_cond  *c_startup;
+
+static SDL_Thread *t_spice  = NULL;
+static SDL_Thread *t_render = NULL;
+static SDL_Thread *t_cursor = NULL;
+static SDL_Cursor *cursor   = NULL;
+
+struct AppState state;
 
 // this structure is initialized in config.c
 struct AppParams params = { 0 };
@@ -97,16 +106,21 @@ static int renderThread(void * unused)
   if (!state.lgr->render_startup(state.lgrData, state.window))
   {
     state.running = false;
+
+    /* unblock threads waiting on the condition */
+    SDL_LockMutex(m_startup);
+    b_startup = true;
+    SDL_CondSignal(c_startup);
+    SDL_UnlockMutex(m_startup);
+
     return 1;
   }
 
-  // start the cursor thread after render startup to prevent a race condition
-  SDL_Thread *t_cursor = NULL;
-  if (!(t_cursor = SDL_CreateThread(cursorThread, "cursorThread", NULL)))
-  {
-    DEBUG_ERROR("cursor create thread failed");
-    return 1;
-  }
+  /* signal to other threads that the renderer is ready */
+  SDL_LockMutex(m_startup);
+  b_startup = true;
+  SDL_CondSignal(c_startup);
+  SDL_UnlockMutex(m_startup);
 
   struct timespec time;
   clock_gettime(CLOCK_MONOTONIC, &time);
@@ -155,7 +169,15 @@ static int renderThread(void * unused)
   }
 
   state.running = false;
-  SDL_WaitThread(t_cursor, NULL);
+
+  if (t_cursor)
+    SDL_WaitThread(t_cursor, NULL);
+
+  if (state.t_frame)
+    SDL_WaitThread(state.t_frame, NULL);
+
+  state.lgr->deinitialize(state.lgrData);
+  state.lgr = NULL;
   return 0;
 }
 
@@ -166,6 +188,11 @@ static int cursorThread(void * unused)
   uint32_t            version        = 0;
 
   memset(&header, 0, sizeof(KVMFRCursor));
+
+  SDL_LockMutex(m_startup);
+  while(!b_startup)
+    SDL_CondWait(c_startup, m_startup);
+  SDL_UnlockMutex(m_startup);
 
   while(state.running)
   {
@@ -280,6 +307,11 @@ static int frameThread(void * unused)
   memset(&header, 0, sizeof(struct KVMFRFrame));
   SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
 
+  SDL_LockMutex(m_startup);
+  while(!b_startup)
+    SDL_CondWait(c_startup, m_startup);
+  SDL_UnlockMutex(m_startup);
+
   while(state.running)
   {
     // poll until we have a new frame
@@ -368,9 +400,9 @@ static int frameThread(void * unused)
         SDL_SetWindowSize(state.window, header.width, header.height);
       updatePositionInfo();
     }
+    FrameBuffer frame = (FrameBuffer)((uint8_t *)state.shm + header.dataPos);
 
-    const uint8_t * data = (const uint8_t *)state.shm + header.dataPos;
-    if (!state.lgr->on_frame_event(state.lgrData, lgrFormat, data))
+    if (!state.lgr->on_frame_event(state.lgrData, lgrFormat, frame))
     {
       DEBUG_ERROR("renderer on frame event returned failure");
       break;
@@ -582,7 +614,10 @@ int eventFilter(void * userdata, SDL_Event * event)
     case SDL_QUIT:
     {
       if (!params.ignoreQuit)
+      {
+        DEBUG_INFO("Quit event received, exiting...");
         state.running = false;
+      }
       return 0;
     }
 
@@ -991,16 +1026,12 @@ static void release_key_binds()
     app_release_keybind(&state.kbCtrlAltFn[i]);
 }
 
-int run()
+static int lg_run()
 {
-  DEBUG_INFO("Looking Glass (" BUILD_VERSION ")");
-  DEBUG_INFO("Locking Method: " LG_LOCK_MODE);
-
   memset(&state, 0, sizeof(state));
   state.running   = true;
   state.scaleX    = 1.0f;
   state.scaleY    = 1.0f;
-  state.frameTime = 1e9 / params.fpsLimit;
 
   state.mouseSens = params.mouseSens;
        if (state.mouseSens < -9) state.mouseSens = -9;
@@ -1045,6 +1076,45 @@ int run()
   signal(SIGINT , int_handler);
   signal(SIGTERM, int_handler);
 
+  // try map the shared memory
+  state.shm = (struct KVMFRHeader *)map_memory();
+  if (!state.shm)
+  {
+    DEBUG_ERROR("Failed to map memory");
+    return -1;
+  }
+
+  // try to connect to the spice server
+  if (params.useSpiceInput || params.useSpiceClipboard)
+  {
+    spice_set_clipboard_cb(
+        spiceClipboardNotice,
+        spiceClipboardData,
+        spiceClipboardRelease,
+        spiceClipboardRequest);
+
+    if (!spice_connect(params.spiceHost, params.spicePort, ""))
+    {
+      DEBUG_ERROR("Failed to connect to spice server");
+      return -1;
+    }
+
+    while(state.running && !spice_ready())
+      if (!spice_process())
+      {
+        state.running = false;
+        DEBUG_ERROR("Failed to process spice messages");
+        return -1;
+      }
+
+    if (!(t_spice = SDL_CreateThread(spiceThread, "spiceThread", NULL)))
+    {
+      DEBUG_ERROR("spice create thread failed");
+      return -1;
+    }
+  }
+
+  // select and init a renderer
   LG_RendererParams lgrParams;
   lgrParams.showFPS = params.showFPS;
   Uint32 sdlFlags;
@@ -1080,6 +1150,7 @@ int run()
     return -1;
   }
 
+  // all our ducks are in a line, create the window
   state.window = SDL_CreateWindow(
     params.windowTitle,
     params.center ? SDL_WINDOWPOS_CENTERED : params.x,
@@ -1102,7 +1173,7 @@ int run()
     return 1;
   }
 
-  if (params.fullscreen)
+  if (params.fullscreen && !params.minimizeOnFocusLoss)
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
   if (!params.noScreensaver)
@@ -1119,6 +1190,26 @@ int run()
 
   // ensure renderer viewport is aware of the current window size
   updatePositionInfo();
+
+  //Auto detect active monitor refresh rate for FPS Limit if no FPS Limit was passed.
+  if (params.fpsLimit == -1)
+  {
+      SDL_DisplayMode current;
+      if (SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(state.window), &current) == 0)
+      {
+          state.frameTime = 1e9 / (current.refresh_rate * 2);
+      }
+      else
+      {
+          DEBUG_WARN("Unable to capture monitor refresh rate using the default FPS Limit: 200");
+          state.frameTime = 1e9 / 200;
+      }
+  }
+  else
+  {
+      DEBUG_INFO("Using the FPS Limit from args: %d", params.fpsLimit);
+      state.frameTime = 1e9 / params.fpsLimit;
+  }
 
   register_key_binds();
 
@@ -1153,12 +1244,6 @@ int run()
     return -1;
   }
 
-  if (!state.window)
-  {
-    DEBUG_ERROR("failed to create window");
-    return -1;
-  }
-
   if (state.lgc)
   {
     DEBUG_INFO("Using Clipboard: %s", state.lgc->getName());
@@ -1171,7 +1256,6 @@ int run()
     state.cbRequestList = ll_new();
   }
 
-  SDL_Cursor *cursor = NULL;
   if (params.hideMouse)
   {
     // work around SDL_ShowCursor being non functional
@@ -1181,131 +1265,105 @@ int run()
     SDL_ShowCursor(SDL_DISABLE);
   }
 
-  SDL_Thread *t_spice  = NULL;
-  SDL_Thread *t_frame  = NULL;
-  SDL_Thread *t_render = NULL;
+  // setup the startup condition
+  b_startup = false;
+  m_startup = SDL_CreateMutex();
+  c_startup = SDL_CreateCond();
 
-  while(1)
+  // start the renderThread so we don't just display junk
+  if (!(t_render = SDL_CreateThread(renderThread, "renderThread", NULL)))
   {
-    state.shm = (struct KVMFRHeader *)map_memory();
-    if (!state.shm)
-    {
-      DEBUG_ERROR("Failed to map memory");
-      break;
-    }
-
-    // start the renderThread so we don't just display junk
-    if (!(t_render = SDL_CreateThread(renderThread, "renderThread", NULL)))
-    {
-      DEBUG_ERROR("render create thread failed");
-      break;
-    }
-
-    if (params.useSpiceInput || params.useSpiceClipboard)
-    {
-      spice_set_clipboard_cb(
-          spiceClipboardNotice,
-          spiceClipboardData,
-          spiceClipboardRelease,
-          spiceClipboardRequest);
-
-      if (!spice_connect(params.spiceHost, params.spicePort, ""))
-      {
-        DEBUG_ERROR("Failed to connect to spice server");
-        return 0;
-      }
-
-      while(state.running && !spice_ready())
-        if (!spice_process())
-        {
-          state.running = false;
-          DEBUG_ERROR("Failed to process spice messages");
-          break;
-        }
-
-      if (!(t_spice = SDL_CreateThread(spiceThread, "spiceThread", NULL)))
-      {
-        DEBUG_ERROR("spice create thread failed");
-        break;
-      }
-    }
-
-    // ensure mouse acceleration is identical in server mode
-    SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1", SDL_HINT_OVERRIDE);
-    SDL_SetEventFilter(eventFilter, NULL);
-
-    // flag the host that we are starting up this is important so that
-    // the host wakes up if it is waiting on an interrupt, the host will
-    // also send us the current mouse shape since we won't know it yet
-    DEBUG_INFO("Waiting for host to signal it's ready...");
-    __sync_or_and_fetch(&state.shm->flags, KVMFR_HEADER_FLAG_RESTART);
-
-    while(state.running && (state.shm->flags & KVMFR_HEADER_FLAG_RESTART))
-      SDL_WaitEventTimeout(NULL, 1000);
-
-    if (!state.running)
-      break;
-
-    DEBUG_INFO("Host ready, starting session");
-
-    // check the header's magic and version are valid
-    if (memcmp(state.shm->magic, KVMFR_HEADER_MAGIC, sizeof(KVMFR_HEADER_MAGIC)) != 0)
-    {
-      DEBUG_ERROR("Invalid header magic, is the host running?");
-      break;
-    }
-
-    if (state.shm->version != KVMFR_HEADER_VERSION)
-    {
-      DEBUG_ERROR("KVMFR version missmatch, expected %u but got %u", KVMFR_HEADER_VERSION, state.shm->version);
-      DEBUG_ERROR("This is not a bug, ensure you have the right version of looking-glass-host.exe on the guest");
-      break;
-    }
-
-    if (!(t_frame = SDL_CreateThread(frameThread, "frameThread", NULL)))
-    {
-      DEBUG_ERROR("frame create thread failed");
-      break;
-    }
-
-    bool *closeAlert = NULL;
-    while(state.running)
-    {
-      SDL_WaitEventTimeout(NULL, 1000);
-
-      if (closeAlert == NULL)
-      {
-        if (state.shm->flags & KVMFR_HEADER_FLAG_PAUSED)
-        {
-          if (state.lgr && params.showAlerts)
-            state.lgr->on_alert(
-              state.lgrData,
-              LG_ALERT_WARNING,
-              "Stream Paused",
-              &closeAlert
-            );
-        }
-      }
-      else
-      {
-        if (!(state.shm->flags & KVMFR_HEADER_FLAG_PAUSED))
-        {
-          *closeAlert = true;
-          closeAlert  = NULL;
-        }
-      }
-    }
-
-    break;
+    DEBUG_ERROR("render create thread failed");
+    return -1;
   }
 
+  // ensure mouse acceleration is identical in server mode
+  SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1", SDL_HINT_OVERRIDE);
+  SDL_SetEventFilter(eventFilter, NULL);
+
+  // flag the host that we are starting up this is important so that
+  // the host wakes up if it is waiting on an interrupt, the host will
+  // also send us the current mouse shape since we won't know it yet
+  DEBUG_INFO("Waiting for host to signal it's ready...");
+  __sync_or_and_fetch(&state.shm->flags, KVMFR_HEADER_FLAG_RESTART);
+
+  while(state.running && (state.shm->flags & KVMFR_HEADER_FLAG_RESTART))
+    SDL_WaitEventTimeout(NULL, 1000);
+
+  if (!state.running)
+    return -1;
+
+  DEBUG_INFO("Host ready, starting session");
+
+  // check the header's magic and version are valid
+  if (memcmp(state.shm->magic, KVMFR_HEADER_MAGIC, sizeof(KVMFR_HEADER_MAGIC)) != 0)
+  {
+    DEBUG_ERROR("Invalid header magic, is the host running?");
+    return -1;
+  }
+
+  if (state.shm->version != KVMFR_HEADER_VERSION)
+  {
+    DEBUG_ERROR("KVMFR version missmatch, expected %u but got %u", KVMFR_HEADER_VERSION, state.shm->version);
+    DEBUG_ERROR("This is not a bug, ensure you have the right version of looking-glass-host.exe on the guest");
+    return -1;
+  }
+
+  if (!(t_cursor = SDL_CreateThread(cursorThread, "cursorThread", NULL)))
+  {
+    DEBUG_ERROR("cursor create thread failed");
+    return 1;
+  }
+
+  if (!(state.t_frame = SDL_CreateThread(frameThread, "frameThread", NULL)))
+  {
+    DEBUG_ERROR("frame create thread failed");
+    return -1;
+  }
+
+  bool *closeAlert = NULL;
+  while(state.running)
+  {
+    SDL_WaitEventTimeout(NULL, 1000);
+
+    if (closeAlert == NULL)
+    {
+      if (state.shm->flags & KVMFR_HEADER_FLAG_PAUSED)
+      {
+        if (state.lgr && params.showAlerts)
+          state.lgr->on_alert(
+            state.lgrData,
+            LG_ALERT_WARNING,
+            "Stream Paused",
+            &closeAlert
+          );
+      }
+    }
+    else
+    {
+      if (!(state.shm->flags & KVMFR_HEADER_FLAG_PAUSED))
+      {
+        *closeAlert = true;
+        closeAlert  = NULL;
+      }
+    }
+  }
+
+  return 0;
+}
+
+static void lg_shutdown()
+{
   state.running = false;
 
   if (t_render)
     SDL_WaitThread(t_render, NULL);
 
-  if (t_frame)
-    SDL_WaitThread(t_frame, NULL);
+  if (m_startup)
+  {
+    SDL_DestroyCond (c_startup);
+    SDL_DestroyMutex(m_startup);
+  }
 
   // if spice is still connected send key up events for any pressed keys
   if (params.useSpiceInput && spice_ready())
@@ -1325,9 +1383,6 @@ int run()
 
     spice_disconnect();
   }
-
-  if (state.lgr)
-    state.lgr->deinitialize(state.lgrData);
 
   if (state.lgc)
   {
@@ -1351,12 +1406,15 @@ int run()
     close(state.shmFD);
   }
 
+  release_key_binds();
   SDL_Quit();
-  return 0;
 }
 
 int main(int argc, char * argv[])
 {
+  DEBUG_INFO("Looking Glass (" BUILD_VERSION ")");
+  DEBUG_INFO("Locking Method: " LG_LOCK_MODE);
+
   if (!installCrashHandler("/proc/self/exe"))
     DEBUG_WARN("Failed to install the crash handler");
 
@@ -1372,9 +1430,10 @@ int main(int argc, char * argv[])
   if (params.grabKeyboard)
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
 
-  const int ret = run();
-  release_key_binds();
+  const int ret = lg_run();
+  lg_shutdown();
 
   config_free();
   return ret;
+
 }

@@ -17,21 +17,42 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#pragma once
-
-#include <stdbool.h>
-#include <stddef.h>
-
 #include <GL/gl.h>
+#include <stdarg.h>
+#include <stdio.h>
 
-typedef struct EGL_Shader EGL_Shader;
+void egl_debug_printf(char * format, ...)
+{
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
 
-bool egl_shader_init(EGL_Shader ** shader);
-void egl_shader_free(EGL_Shader ** shader);
+  GLenum error = glGetError();
+  switch(error)
+  {
+    case GL_NO_ERROR:
+      fprintf(stderr, " (GL_NO_ERROR)\n");
+      break;
 
-bool egl_shader_load   (EGL_Shader * model, const char * vertex_file, const char * fragment_file);
-bool egl_shader_compile(EGL_Shader * model, const char * vertex_code, size_t vertex_size, const char * fragment_code, size_t fragment_size);
-void egl_shader_use    (EGL_Shader * shader);
+    case GL_INVALID_ENUM:
+      fprintf(stderr, " (GL_INVALID_ENUM)\n");
+      break;
 
-void egl_shader_associate_textures(EGL_Shader * shader, const int count);
-GLint egl_shader_get_uniform_location(EGL_Shader * shader, const char * name);
+    case GL_INVALID_VALUE:
+      fprintf(stderr, " (GL_INVALID_VALUE)\n");
+      break;
+
+    case GL_INVALID_OPERATION:
+      fprintf(stderr, " (GL_INVALID_OPERATION)\n");
+      break;
+
+    case GL_INVALID_FRAMEBUFFER_OPERATION:
+      fprintf(stderr, " (GL_INVALID_FRAMEBUFFER_OPERATION)\n");
+      break;
+
+    case GL_OUT_OF_MEMORY:
+      fprintf(stderr, " (GL_OUT_OF_MEMORY)\n");
+      break;
+  }
+}

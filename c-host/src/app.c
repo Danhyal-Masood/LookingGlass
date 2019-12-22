@@ -49,7 +49,7 @@ struct app
 
   uint8_t     * frames;
   unsigned int  frameSize;
-  uint8_t     * frame[MAX_FRAMES];
+  FrameBuffer   frame[MAX_FRAMES];
   unsigned int  frameOffset[MAX_FRAMES];
 
   bool             running;
@@ -162,17 +162,17 @@ static int frameThread(void * opaque)
   volatile KVMFRFrame * fi = &(app.shmHeader->frame);
 
   bool         frameValid     = false;
+  bool         repeatFrame    = false;
   int          frameIndex     = 0;
   unsigned int clientInstance = 0;
   CaptureFrame frame          = { 0 };
 
   while(app.running)
   {
-    frame.data = app.frame[frameIndex];
-
-    switch(app.iface->getFrame(&frame))
+    switch(app.iface->waitFrame(&frame))
     {
       case CAPTURE_RESULT_OK:
+        repeatFrame = false;
         break;
 
       case CAPTURE_RESULT_REINIT:
@@ -193,8 +193,7 @@ static int frameThread(void * opaque)
         if (frameValid && clientInstance != app.clientInstance)
         {
           // resend the last frame
-          if (--frameIndex < 0)
-            frameIndex = MAX_FRAMES - 1;
+          repeatFrame = true;
           break;
         }
 
@@ -208,25 +207,32 @@ static int frameThread(void * opaque)
     while(fi->flags & KVMFR_FRAME_FLAG_UPDATE && app.running)
       usleep(1000);
 
-    switch(frame.format)
+    if (repeatFrame)
+      INTERLOCKED_OR8(&fi->flags, KVMFR_FRAME_FLAG_UPDATE);
+    else
     {
-      case CAPTURE_FMT_BGRA  : fi->type = FRAME_TYPE_BGRA  ; break;
-      case CAPTURE_FMT_RGBA  : fi->type = FRAME_TYPE_RGBA  ; break;
-      case CAPTURE_FMT_RGBA10: fi->type = FRAME_TYPE_RGBA10; break;
-      case CAPTURE_FMT_YUV420: fi->type = FRAME_TYPE_YUV420; break;
-      default:
-        DEBUG_ERROR("Unsupported frame format %d, skipping frame", frame.format);
-        continue;
+      switch(frame.format)
+      {
+        case CAPTURE_FMT_BGRA  : fi->type = FRAME_TYPE_BGRA  ; break;
+        case CAPTURE_FMT_RGBA  : fi->type = FRAME_TYPE_RGBA  ; break;
+        case CAPTURE_FMT_RGBA10: fi->type = FRAME_TYPE_RGBA10; break;
+        case CAPTURE_FMT_YUV420: fi->type = FRAME_TYPE_YUV420; break;
+        default:
+          DEBUG_ERROR("Unsupported frame format %d, skipping frame", frame.format);
+          continue;
+      }
+
+      fi->width   = frame.width;
+      fi->height  = frame.height;
+      fi->stride  = frame.stride;
+      fi->pitch   = frame.pitch;
+      fi->dataPos = app.frameOffset[frameIndex];
+      frameValid  = true;
+
+      framebuffer_prepare(app.frame[frameIndex]);
+      INTERLOCKED_OR8(&fi->flags, KVMFR_FRAME_FLAG_UPDATE);
+      app.iface->getFrame(app.frame[frameIndex]);
     }
-
-    fi->width   = frame.width;
-    fi->height  = frame.height;
-    fi->stride  = frame.stride;
-    fi->pitch   = frame.pitch;
-    fi->dataPos = app.frameOffset[frameIndex];
-    frameValid  = true;
-
-    INTERLOCKED_OR8(&fi->flags, KVMFR_FRAME_FLAG_UPDATE);
 
     if (++frameIndex == MAX_FRAMES)
       frameIndex = 0;
@@ -363,14 +369,14 @@ int app_main(int argc, char * argv[])
   app.frames           = (uint8_t *)ALIGN_UP(app.pointerData + app.pointerDataSize);
   app.frameSize        = ALIGN_DN((shmemSize - (app.frames - shmemMap)) / MAX_FRAMES);
 
-  DEBUG_INFO("Max Cursor Size  : %u MiB"     , app.pointerDataSize / 1048576);
-  DEBUG_INFO("Max Frame Size   : %u MiB"     , app.frameSize      / 1048576);
+  DEBUG_INFO("Max Cursor Size  : %u MiB", app.pointerDataSize / 1048576);
+  DEBUG_INFO("Max Frame Size   : %u MiB", app.frameSize       / 1048576);
   DEBUG_INFO("Cursor           : 0x%" PRIXPTR " (0x%08x)", (uintptr_t)app.pointerData, app.pointerOffset);
 
   for (int i = 0; i < MAX_FRAMES; ++i)
   {
-    app.frame      [i] = app.frames + i * app.frameSize;
-    app.frameOffset[i] = app.frame[i] - shmemMap;
+    app.frame      [i] = (FrameBuffer)(app.frames + i * app.frameSize);
+    app.frameOffset[i] = (uint8_t *)app.frame[i] - shmemMap;
     DEBUG_INFO("Frame %d          : 0x%" PRIXPTR " (0x%08x)", i, (uintptr_t)app.frame[i], app.frameOffset[i]);
   }
 

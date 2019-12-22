@@ -19,6 +19,9 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #include "texture.h"
 #include "common/debug.h"
+#include "common/locking.h"
+#include "common/framebuffer.h"
+#include "debug.h"
 #include "utils.h"
 
 #include <stdlib.h>
@@ -43,14 +46,14 @@ struct EGL_Texture
   GLenum   format;
   GLenum   dataType;
 
-  bool   hasPBO;
-  GLuint pbo[2];
-  int    pboRIndex;
-  int    pboWIndex;
-  int    pboCount;
-  size_t pboBufferSize;
-  void * pboMap[2];
-  GLsync pboSync[2];
+  bool         hasPBO;
+  GLuint       pbo[2];
+  int          pboRIndex;
+  int          pboWIndex;
+  volatile int pboCount;
+  size_t       pboBufferSize;
+  void *       pboMap[2];
+  GLsync       pboSync[2];
 };
 
 bool egl_texture_init(EGL_Texture ** texture)
@@ -233,7 +236,7 @@ bool egl_texture_setup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt, size_
 
       if (!texture->pboMap[i])
       {
-        DEBUG_ERROR("glMapBufferRange failed for %d of %lu bytes", i, texture->pboBufferSize);
+        EGL_ERROR("glMapBufferRange failed for %d of %lu bytes", i, texture->pboBufferSize);
         return false;
       }
     }
@@ -258,7 +261,7 @@ bool egl_texture_update(EGL_Texture * texture, const uint8_t * buffer)
 
     if (++texture->pboWIndex == 2)
       texture->pboWIndex = 0;
-    ++texture->pboCount;
+    INTERLOCKED_INC(&texture->pboCount);
   }
   else
   {
@@ -273,6 +276,24 @@ bool egl_texture_update(EGL_Texture * texture, const uint8_t * buffer)
     }
     glBindTexture(GL_TEXTURE_2D, 0);
   }
+  return true;
+}
+
+bool egl_texture_update_from_frame(EGL_Texture * texture, const FrameBuffer frame)
+{
+  if (!texture->streaming)
+    return false;
+
+  if (texture->pboCount == 2)
+    return true;
+
+  framebuffer_read(frame, texture->pboMap[texture->pboWIndex], texture->pboBufferSize);
+  texture->pboSync[texture->pboWIndex] = 0;
+
+  if (++texture->pboWIndex == 2)
+    texture->pboWIndex = 0;
+  INTERLOCKED_INC(&texture->pboCount);
+
   return true;
 }
 
@@ -302,7 +323,7 @@ enum EGL_TexStatus egl_texture_process(EGL_Texture * texture)
 
   /* wait for the buffer to be ready */
   pos = texture->pboRIndex;
-  switch(glClientWaitSync(texture->pboSync[pos], GL_SYNC_FLUSH_COMMANDS_BIT, 0))
+  switch(glClientWaitSync(texture->pboSync[pos], 0, 0))
   {
     case GL_ALREADY_SIGNALED:
     case GL_CONDITION_SATISFIED:
@@ -313,7 +334,7 @@ enum EGL_TexStatus egl_texture_process(EGL_Texture * texture)
 
     case GL_WAIT_FAILED:
       glDeleteSync(texture->pboSync[pos]);
-      DEBUG_ERROR("glClientWaitSync failed");
+      EGL_ERROR("glClientWaitSync failed");
       return EGL_TEX_STATUS_ERROR;
   }
 
@@ -336,7 +357,7 @@ enum EGL_TexStatus egl_texture_process(EGL_Texture * texture)
   /* advance the read index */
   if (++texture->pboRIndex == 2)
     texture->pboRIndex = 0;
-  --texture->pboCount;
+  INTERLOCKED_DEC(&texture->pboCount);
 
   texture->ready = true;
 

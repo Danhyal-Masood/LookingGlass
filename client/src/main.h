@@ -49,6 +49,8 @@ struct AppState
   void               * lgrData;
   bool                 lgrResize;
 
+  SDL_Thread         * t_frame;
+
   const LG_Clipboard * lgc;
   SpiceDataType        cbType;
   struct ll          * cbRequestList;
@@ -82,6 +84,7 @@ struct AppParams
   bool         borderless;
   bool         fullscreen;
   bool         maximize;
+  bool         minimizeOnFocusLoss;
   bool         center;
   int          x, y;
   unsigned int w, h;
